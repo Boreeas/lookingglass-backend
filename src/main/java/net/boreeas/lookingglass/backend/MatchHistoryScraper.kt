@@ -5,6 +5,7 @@ import net.boreeas.lookingglass.Main
 import net.boreeas.lookingglass.using
 import net.boreeas.reweave.PublicApiConnection
 import net.boreeas.reweave.RequestException
+import java.time.Instant
 import java.time.OffsetDateTime
 import java.util.*
 import java.util.concurrent.ArrayBlockingQueue
@@ -58,7 +59,7 @@ class MatchHistoryScraper(
             refillQueue(cycleCount++)
 
             if (cycleCount % 8 == 0) {
-                println("Did a full cycle, sleeping a bit then logging back in")
+                println("[${Instant.now()}] Did a full cycle, sleeping a bit then logging back in")
                 Thread.sleep(60 * 1000)
                 println("Relogin")
                 shardboundApi = apiProvider.getApi()
