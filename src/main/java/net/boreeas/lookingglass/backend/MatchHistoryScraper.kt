@@ -62,7 +62,14 @@ class MatchHistoryScraper(
                 println("[${Instant.now()}] Did a full cycle, sleeping a bit then logging back in")
                 Thread.sleep(60 * 1000)
                 println("Relogin")
-                shardboundApi = apiProvider.getApi()
+                while (true) {
+                    try {
+                        shardboundApi = apiProvider.getApi()
+                        break
+                    } catch (ex: RequestException) {
+                        System.err.println("${ex.message}, retrying")
+                    }
+                }
             }
         }
     }
