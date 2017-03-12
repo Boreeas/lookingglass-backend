@@ -2,9 +2,11 @@ package net.boreeas.lookingglass.backend
 
 import com.mchange.v2.c3p0.ComboPooledDataSource
 import net.boreeas.lookingglass.Main
-import net.boreeas.lookingglass.using
 import net.boreeas.reweave.PublicApiConnection
 import net.boreeas.reweave.RequestException
+import org.apache.cxf.interceptor.Fault
+import java.sql.ResultSet
+import java.sql.SQLException
 import java.time.Instant
 import java.time.OffsetDateTime
 import java.util.*
@@ -36,12 +38,53 @@ class MatchHistoryScraper(
     private val idsInThreads = ArrayDeque<String>()
     private val threads = ArrayDeque<Future<Any>>()
 
-    private val mainThreadDbConn = dataSource.getDbConnection()
+    private var mainThreadDbConn = dataSource.getDbConnection()
 
     init {
-        mainThreadDbConn.createSchema()
+        dbRetry { mainThreadDbConn.createSchema() }
         for (i in 0..MAX_CONCURRENCY - 1) {
             concurrencyAvailability.put(MARKER)
+        }
+    }
+
+    private fun <T> apiRetry(block: () -> T): T {
+        while (true) {
+            try {
+                return block()
+            } catch (ex: RequestException) {
+                System.err.println("${ex.message}, retrying in a bit")
+                Thread.sleep(1000)
+            } catch (ex: Fault) {
+                System.err.println("${ex.message}, retrying in a bit")
+                Thread.sleep(1000)
+            }
+        }
+    }
+
+    private fun <T> dbRetry(block: () -> T): T {
+        while (true) {
+            try {
+                return block()
+            } catch (ex: SQLException) {
+                ex.printStackTrace()
+                System.err.println("Probably a connection error, opening a new connection")
+                mainThreadDbConn.close()
+                mainThreadDbConn = dataSource.getDbConnection()
+            }
+        }
+    }
+
+    private fun <T> dbRetry(conn: DBConnection, block: DBConnection.() -> T): T {
+        var conn = conn
+        while (true) {
+            try {
+                return block(conn)
+            } catch (ex: SQLException) {
+                ex.printStackTrace()
+                System.err.println("Probably a connection error, opening a new connection")
+                conn.close()
+                conn = dataSource.getDbConnection()
+            }
         }
     }
 
@@ -62,14 +105,7 @@ class MatchHistoryScraper(
                 println("[${Instant.now()}] Did a full cycle, sleeping a bit then logging back in")
                 Thread.sleep(60 * 1000)
                 println("Relogin")
-                while (true) {
-                    try {
-                        shardboundApi = apiProvider.getApi()
-                        break
-                    } catch (ex: RequestException) {
-                        System.err.println("${ex.message}, retrying")
-                    }
-                }
+                shardboundApi = apiRetry { apiProvider.getApi() }
             }
         }
     }
@@ -106,7 +142,9 @@ class MatchHistoryScraper(
             OffsetDateTime.now().minusDays(1)
         }
 
-        val longestUnupdatedPlayers = mainThreadDbConn.getLongestUnupdatedPlayers(QUEUE_MAX_REFILL_SIZE, latestGameAfter)
+        val longestUnupdatedPlayers = dbRetry {
+            mainThreadDbConn.getLongestUnupdatedPlayers(QUEUE_MAX_REFILL_SIZE, latestGameAfter)
+        }
         println("Refilling queue with ${longestUnupdatedPlayers.count()} ids")
         for (id in longestUnupdatedPlayers) {
             idsInQueue.add(id)
@@ -122,32 +160,23 @@ class MatchHistoryScraper(
     }
 
     private fun updatePlayer(id: String) {
-        if (!mainThreadDbConn.playerExists(id)) {
-            while (true) {
-                try {
-                    val userData = shardboundApi.user.retrieve(id).get()
-                    mainThreadDbConn.createPlayer(userData)
-                    break
-                } catch (ex: RequestException) {
-                    ex.printStackTrace()
-                    System.err.println("Failed to retrieve userdata for $id, retrying in a bit")
-                    Thread.sleep(1000)
-                }
-            }
+        val playerExists = dbRetry { mainThreadDbConn.playerExists(id) }
+        if (!playerExists) {
+            val userData = apiRetry { shardboundApi.user.retrieve(id).get() }
+            dbRetry { mainThreadDbConn.createPlayer(userData) }
         }
 
         concurrencyAvailability.take()
         idsInThreads.add(id)
         threads.add(shardboundApi.user.withMatchHistory(id) {
-            using {
-                val dbConn = dataSource.getDbConnection().autoClose()
+            val dbConn = dataSource.getDbConnection()
 
-                val history = it.filter { it.opponentId != null }
-                history.filter { !dbConn.playerExists(it.opponentId!!) }.forEach { enqueue(it.opponentId!!) }
-                dbConn.insertGames(history, id)
+            val history = it.filter { it.opponentId != null }
+            history.filterNot { dbRetry(dbConn) { this.playerExists(it.opponentId!!) } }.forEach { enqueue(it.opponentId!!) }
+            dbRetry(dbConn) { this.insertGames(history, id) }
 
-                concurrencyAvailability.add(MARKER)
-            }
+            concurrencyAvailability.add(MARKER)
+            dbConn.close()
         })
     }
 
@@ -170,49 +199,58 @@ class MatchHistoryScraper(
     }
 
     private fun analyzeGames() {
-        using {
-            println("Analyzing games")
-            val gameDataStream = dataSource.connection.autoClose()
-            val stmt = gameDataStream.prepareStatement("""SELECT
-                    game.game_id AS game_id,
-                    pl1.end_result AS end_result,
-                    player1.player_id AS player_a,
-                    player2.player_id AS player_b,
-                    game.start_date
-                            FROM Games game
-                    , Players player1 INNER JOIN PlayerPlayedGame pl1 USING (player_id)
-                    , Players player2 INNER JOIN PlayerPlayedGame pl2 USING (player_id)
-                    WHERE player1.player_id < player2.player_id
-                    AND pl1.game_id = game.game_id AND pl2.game_id = game.game_id
-                    AND pl1.elo_diff IS NULL AND pl2.elo_diff IS NULL
-                    AND pl1.end_result != 'Coop Win' AND pl1.end_result != 'Coop Loss'
-                    ORDER BY start_date ASC
-                    """)
+        println("Analyzing games")
+        var gameDataStream = dataSource.connection
+        val stmt = gameDataStream.prepareStatement("""SELECT
+                game.game_id AS game_id,
+                pl1.end_result AS end_result,
+                player1.player_id AS player_a,
+                player2.player_id AS player_b,
+                game.start_date
+                        FROM Games game
+                , Players player1 INNER JOIN PlayerPlayedGame pl1 USING (player_id)
+                , Players player2 INNER JOIN PlayerPlayedGame pl2 USING (player_id)
+                WHERE player1.player_id < player2.player_id
+                AND pl1.game_id = game.game_id AND pl2.game_id = game.game_id
+                AND pl1.elo_diff IS NULL AND pl2.elo_diff IS NULL
+                AND pl1.end_result != 'Coop Win' AND pl1.end_result != 'Coop Loss'
+                ORDER BY start_date ASC
+                """)
 
-            val result = stmt.executeQuery()
-            var counter = 0
-            print("0 games updates")
-            while (result.next()) {
-                updateElo(
-                        result.getString("game_id"),
-                        result.getString("end_result"),
-                        result.getString("player_a"),
-                        result.getString("player_b")
-                )
-
-                counter++
-                if (counter % Main.DEBUG_RATE == 0) {
-                    print("\r$counter games updated")
-                    System.out.flush()
-                }
+        var result: ResultSet
+        while (true) {
+            try {
+                result = stmt.executeQuery()
+                break
+            } catch (ex: SQLException) {
+                System.err.println("Error retrieving unupdated games, retrying")
+                gameDataStream.close()
+                gameDataStream = dataSource.connection
             }
-            println("\r$counter games updated")
         }
+        var counter = 0
+        print("0 games updates")
+        while (result.next()) {
+            updateElo(
+                    result.getString("game_id"),
+                    result.getString("end_result"),
+                    result.getString("player_a"),
+                    result.getString("player_b")
+            )
+
+            counter++
+            if (counter % Main.DEBUG_RATE == 0) {
+                print("\r$counter games updated")
+                System.out.flush()
+            }
+        }
+        println("\r$counter games updated")
+        gameDataStream.close()
     }
 
     private fun updateElo(game: String, end_result: String, playerA: String, playerB: String) {
-        val playerAElo = mainThreadDbConn.getElo(playerA)
-        val playerBElo = mainThreadDbConn.getElo(playerB)
+        val playerAElo = dbRetry { mainThreadDbConn.getElo(playerA) }
+        val playerBElo = dbRetry { mainThreadDbConn.getElo(playerB) }
 
         // How much the opponent is better than the player, where each 400 points are roughly
         // a 10x difference in skill
@@ -230,11 +268,13 @@ class MatchHistoryScraper(
         var playerScoreDiff = 40 * (playerScore - playerWinExpectancy)
         if (playerScoreDiff >= 0 && playerScoreDiff < 1) {
             playerScoreDiff = 1.0
-        } else if (playerScoreDiff < 0 && playerScoreDiff > -1){
+        } else if (playerScoreDiff < 0 && playerScoreDiff > -1) {
             playerScoreDiff = -1.0
         }
 
 
-        mainThreadDbConn.updateEloValues(game, playerA, playerScoreDiff.toInt(), playerB, -playerScoreDiff.toInt())
+        dbRetry {
+            mainThreadDbConn.updateEloValues(game, playerA, playerScoreDiff.toInt(), playerB, -playerScoreDiff.toInt())
+        }
     }
 }

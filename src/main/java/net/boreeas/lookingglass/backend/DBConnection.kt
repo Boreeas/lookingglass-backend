@@ -271,6 +271,9 @@ class DBConnection(val connection: Connection) : AutoCloseable {
                 connection.commit()
                 return result
             } catch (ex: SQLException) {
+                if (ex.message?.contains("I/O error") ?: false) {
+                    throw ex // Can't handle I/O errors at this level
+                }
                 ex.printStackTrace()
                 System.err.println("Execution of SQL statement failed, retrying")
                 // Retry
