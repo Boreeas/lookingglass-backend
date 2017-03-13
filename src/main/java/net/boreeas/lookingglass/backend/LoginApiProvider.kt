@@ -15,6 +15,7 @@ class LoginApiProvider(
     override fun getApi(): PublicApiConnection {
         val conn = ShardboundServer().toAuthorizedConnection(name, password)
         if (bucketMaker != null) conn.bucket = bucketMaker.build()
+        conn.retryOnError = true
         return conn
     }
 }
