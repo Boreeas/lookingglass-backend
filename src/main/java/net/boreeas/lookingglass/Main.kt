@@ -13,7 +13,7 @@ import java.util.concurrent.TimeUnit
  */
 object Main {
     var DEBUG = false
-    var DEBUG_RATE = 1000;
+    var DEBUG_RATE = 1000
 
     @JvmStatic fun main(args: Array<String>) {
         val prop = Properties()
@@ -22,11 +22,11 @@ object Main {
         DEBUG_RATE = prop.getProperty("debug.rate", "1000").toInt()
 
         val ratelimitBurst = prop.getProperty("ratelimitBurst").toLong()
-        val rateLimitPerSecond = prop.getProperty("ratelimitPerSecond").toLong()
+        val rateLimitPerSecond = prop.getProperty("ratelimitPerSecond").toDouble()
         val rateLimitInterval = 1000 * ratelimitBurst / rateLimitPerSecond
         val bucket = Buckets
                 .withMillisTimePrecision()
-                .withLimitedBandwidth(ratelimitBurst, TimeUnit.MILLISECONDS, rateLimitInterval)
+                .withLimitedBandwidth(ratelimitBurst, TimeUnit.MILLISECONDS, rateLimitInterval.toLong())
         val provider = LoginApiProvider(prop.getProperty("username"), prop.getProperty("password"), bucket)
 
         val dataSource = ComboPooledDataSource()
