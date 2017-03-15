@@ -139,7 +139,7 @@ class MatchHistoryScraper(
         } else if (cycleCount % 2 == 0) {
             OffsetDateTime.now().minusHours(4)
         } else {
-            OffsetDateTime.now().minusHours(1)
+            OffsetDateTime.now().minusHours(2)
         }
 
         val longestUnupdatedPlayers = dbRetry {
