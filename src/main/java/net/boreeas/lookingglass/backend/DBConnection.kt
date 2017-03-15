@@ -44,10 +44,9 @@ class DBConnection(val connection: Connection) : AutoCloseable {
                     normalized_display_name TEXT                   NOT NULL,
                     player_id             TEXT PRIMARY KEY,
                     last_checked          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_DATE,
-                    next_game_id          TEXT                     DEFAULT NULL,
-                    last_checked_game_date TIMESTAMP WITH TIME ZONE DEFAULT NULL,
                     elo                   INT                      NOT NULL DEFAULT 0,
-                    visibility_restricted BOOLEAN                  NOT NULL DEFAULT FALSE
+                    visibility_restricted BOOLEAN                  NOT NULL DEFAULT FALSE,
+                    trigger_update        BOOLEAN                  NOT NULL DEFAULT FALSE
                 )""")
         stmt.addBatch("""
                 CREATE TABLE IF NOT EXISTS Games (
@@ -137,16 +136,6 @@ class DBConnection(val connection: Connection) : AutoCloseable {
         }
     }
 
-    fun getNextGameId(playerId: String): String? {
-        return retryAndCommit {
-            val stmt = connection.prepareStatement("SELECT next_game_id FROM Players WHERE player_id = ?")
-            stmt.setString(1, playerId)
-
-            val result = stmt.executeQuery()!!
-            if (!result.next()) null else result.getString(1)
-        }
-    }
-
     fun playerExists(playerId: String): Boolean {
         return retryAndCommit {
             val stmt = connection.prepareStatement("SELECT COUNT(*) FROM Players WHERE player_id = ?")
@@ -210,7 +199,7 @@ class DBConnection(val connection: Connection) : AutoCloseable {
         }
     }
 
-    fun getLongestUnupdatedPlayers(max: Int, lastGameAfter: OffsetDateTime): List<String> {
+    fun getPlayersToUpdate(max: Int, lastGameAfter: OffsetDateTime): List<String> {
         return retryAndCommit {
             val stmt = connection.prepareStatement(
                     """SELECT p.player_id
@@ -222,7 +211,8 @@ class DBConnection(val connection: Connection) : AutoCloseable {
                                     WHERE p.player_id = pl.player_id) >= ?
                                    OR NOT EXISTS(SELECT *
                                                  FROM playerplayedgame pl2
-                                                 WHERE pl2.player_id = p.player_id))
+                                                 WHERE pl2.player_id = p.player_id)
+                                   OR p.trigger_update)
                         ORDER BY last_checked ASC
                         LIMIT ?;
                         """
@@ -237,6 +227,16 @@ class DBConnection(val connection: Connection) : AutoCloseable {
             }
 
             list
+        }
+    }
+
+    fun markPlayerUpdated(id: String) {
+        retryAndCommit {
+            val stmt = connection.prepareStatement("UPDATE Players SET trigger_update = FALSE, last_checked = ? WHERE player_id = ?")
+            stmt.setObject(1, OffsetDateTime.now())
+            stmt.setString(2, id)
+
+            stmt.execute()
         }
     }
 
@@ -279,6 +279,20 @@ class DBConnection(val connection: Connection) : AutoCloseable {
                 // Retry
             } finally {
                 connection.autoCommit = true
+            }
+        }
+    }
+
+    fun getLatestGame(id: String): OffsetDateTime {
+        return retryAndCommit {
+            val stmt = connection.prepareStatement("SELECT MAX(start_date) FROM Games INNER JOIN playerplayedgame USING (game_id) WHERE player_id = ?")
+            stmt.setString(1, id)
+
+            val result = stmt.executeQuery()
+            if (result.next() && result.getObject(1) != null) {
+                result.getObject(1, OffsetDateTime::class.java)
+            } else {
+                MIN_DATETIME
             }
         }
     }

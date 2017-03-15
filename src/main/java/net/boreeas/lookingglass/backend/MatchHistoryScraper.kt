@@ -24,12 +24,13 @@ class MatchHistoryScraper(
 ) : Runnable {
     companion object {
         private val QUEUE_MAX_REFILL_SIZE = 1024 * 1024
-        private val MAX_CONCURRENCY = 100
+        private val MAX_CONCURRENCY = 10
     }
 
     private var shardboundApi: PublicApiConnection = apiProvider.getApi()
 
     private val idsInQueue = HashSet<String>(seedIds) // Fast checking
+    private val idsUpdated = HashSet<String>() // Don't double-check
     private val ids = ArrayDeque<String>(seedIds) // Ordering
 
     private val concurrencyAvailability = ArrayBlockingQueue<Any>(MAX_CONCURRENCY)
@@ -89,24 +90,20 @@ class MatchHistoryScraper(
     }
 
     override fun run() {
-        var cycleCount = 0
-
         println("Starting...")
         if (ids.isEmpty()) {
-            refillQueue(cycleCount++)
+            refillQueue()
         }
 
         while (true) {
             workOnQueue()
             analyzeGames()
-            refillQueue(cycleCount++)
+            refillQueue()
 
-            if (cycleCount % 8 == 0) {
-                println("[${Instant.now()}] Did a full cycle, sleeping a bit then logging back in")
-                Thread.sleep(60 * 1000)
-                println("Relogin")
-                shardboundApi = apiRetry { apiProvider.getApi() }
-            }
+            println("[${Instant.now()}] Did a full cycle, sleeping a bit then logging back in")
+            Thread.sleep(30 * 1000)
+            println("Relogin")
+            shardboundApi = apiRetry { apiProvider.getApi() }
         }
     }
 
@@ -119,19 +116,19 @@ class MatchHistoryScraper(
 
             val next = ids.remove()
             idsInQueue.remove(next)
+            idsUpdated.add(next)
             updatePlayer(next)
         }
     }
 
 
-    private fun refillQueue(cycleCount: Int) {
+    private fun refillQueue() {
         /*
          * Update players who played within the last
          * - day        =>  every update
          * - week       =>  every other update
          * - month      =>  every 4th update
          * - ever       =>  every 8nd update
-         */
         val latestGameAfter = if (cycleCount % 8 == 0) {
             DBConnection.MIN_DATETIME
         } else if (cycleCount % 4 == 0) {
@@ -141,15 +138,18 @@ class MatchHistoryScraper(
         } else {
             OffsetDateTime.now().minusDays(1)
         }
+     */
 
         val longestUnupdatedPlayers = dbRetry {
-            mainThreadDbConn.getLongestUnupdatedPlayers(QUEUE_MAX_REFILL_SIZE, latestGameAfter)
+            mainThreadDbConn.getPlayersToUpdate(QUEUE_MAX_REFILL_SIZE, OffsetDateTime.now().minusDays(1))
         }
         println("Refilling queue with ${longestUnupdatedPlayers.count()} ids")
         for (id in longestUnupdatedPlayers) {
             idsInQueue.add(id)
             ids.offer(id)
         }
+
+        idsUpdated.clear()
     }
 
     private fun enqueue(id: String) {
@@ -171,9 +171,21 @@ class MatchHistoryScraper(
         threads.add(shardboundApi.user.withMatchHistory(id) {
             val dbConn = dataSource.getDbConnection()
 
+            val lastUpdatedGame = dbRetry(dbConn) { this.getLatestGame(id) }
+            // Filter for non-visited non-bot games
             val history = it.filter { it.opponentId != null }
-            history.filterNot { dbRetry(dbConn) { this.playerExists(it.opponentId!!) } }.forEach { enqueue(it.opponentId!!) }
+                            .filter { it.startDate!!.isAfter(lastUpdatedGame) }
+
+            // Enqueue all players not known yet
+            history.filterNot { dbRetry(dbConn) { this.playerExists(it.opponentId!!) } }
+                    .forEach { enqueue(it.opponentId!!) }
+            // Enqueue all players that should be updated but weren't
+            history.filterNot { idsInQueue.contains(it.opponentId) }
+                    .filterNot { idsUpdated.contains(it.opponentId) }
+                    .forEach { enqueue(it.opponentId!!) }
+
             dbRetry(dbConn) { this.insertGames(history, id) }
+            dbRetry(dbConn) { this.markPlayerUpdated(id) }
 
             concurrencyAvailability.add(MARKER)
             dbConn.close()
