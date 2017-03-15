@@ -90,18 +90,20 @@ class MatchHistoryScraper(
     }
 
     override fun run() {
+        var cycleCount = 0
+
         println("Starting...")
         if (ids.isEmpty()) {
-            refillQueue()
+            refillQueue(cycleCount++)
         }
 
         while (true) {
             workOnQueue()
             analyzeGames()
-            refillQueue()
+            refillQueue(cycleCount++)
 
-            println("[${Instant.now()}] Did a full cycle, sleeping a bit then logging back in")
-            Thread.sleep(30 * 1000)
+            println("[${Instant.now()}] Finished a cycle ($cycleCount), sleeping a bit then logging back in")
+            Thread.sleep(5 * 1000)
             println("Relogin")
             shardboundApi = apiRetry { apiProvider.getApi() }
         }
@@ -122,26 +124,26 @@ class MatchHistoryScraper(
     }
 
 
-    private fun refillQueue() {
+    private fun refillQueue(cycleCount: Int) {
         /*
          * Update players who played within the last
          * - day        =>  every update
          * - week       =>  every other update
          * - month      =>  every 4th update
          * - ever       =>  every 8nd update
+         */
         val latestGameAfter = if (cycleCount % 8 == 0) {
-            DBConnection.MIN_DATETIME
-        } else if (cycleCount % 4 == 0) {
-            OffsetDateTime.now().minusMonths(1)
-        } else if (cycleCount % 2 == 0) {
-            OffsetDateTime.now().minusWeeks(1)
-        } else {
             OffsetDateTime.now().minusDays(1)
+        } else if (cycleCount % 4 == 0) {
+            OffsetDateTime.now().minusHours(12)
+        } else if (cycleCount % 2 == 0) {
+            OffsetDateTime.now().minusHours(4)
+        } else {
+            OffsetDateTime.now().minusHours(1)
         }
-     */
 
         val longestUnupdatedPlayers = dbRetry {
-            mainThreadDbConn.getPlayersToUpdate(QUEUE_MAX_REFILL_SIZE, OffsetDateTime.now().minusDays(1))
+            mainThreadDbConn.getPlayersToUpdate(QUEUE_MAX_REFILL_SIZE, latestGameAfter)
         }
         println("Refilling queue with ${longestUnupdatedPlayers.count()} ids")
         for (id in longestUnupdatedPlayers) {
@@ -174,7 +176,7 @@ class MatchHistoryScraper(
             val lastUpdatedGame = dbRetry(dbConn) { this.getLatestGame(id) }
             // Filter for non-visited non-bot games
             val history = it.filter { it.opponentId != null }
-                            .filter { it.startDate!!.isAfter(lastUpdatedGame) }
+                    .filter { it.startDate!!.isAfter(lastUpdatedGame) }
 
             // Enqueue all players not known yet
             history.filterNot { dbRetry(dbConn) { this.playerExists(it.opponentId!!) } }
