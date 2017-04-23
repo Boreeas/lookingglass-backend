@@ -2,8 +2,8 @@ package net.boreeas.lookingglass
 
 import com.github.bucket4j.Buckets
 import com.mchange.v2.c3p0.ComboPooledDataSource
-import net.boreeas.lookingglass.backend.SteamLoginApiProvider
 import net.boreeas.lookingglass.backend.MatchHistoryScraper
+import net.boreeas.lookingglass.backend.SteamLoginApiProvider
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.util.*
@@ -20,9 +20,6 @@ object Main {
 
     @JvmStatic fun main(args: Array<String>) {
 
-        return
-
-
         val prop = Properties()
         prop.load(FileInputStream("config.secret"))
         DEBUG = prop.getProperty("debug", "false").toBoolean()
@@ -34,7 +31,7 @@ object Main {
         val bucket = Buckets
                 .withMillisTimePrecision()
                 .withLimitedBandwidth(ratelimitBurst, TimeUnit.MILLISECONDS, rateLimitInterval.toLong())
-        val provider = SteamLoginApiProvider(prop.getProperty("username"), prop.getProperty("password"), bucket)
+        val provider = SteamLoginApiProvider(bucket)
 
         val dataSource = ComboPooledDataSource()
         dataSource.jdbcUrl = "jdbc:postgresql://localhost:5432/" + prop.getProperty("dbname")
