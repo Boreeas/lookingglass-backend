@@ -5,3 +5,4 @@ config.secret
 *.sql
 dependency-reduced-pom.xml
 lookingglass.iml
+steam_appid.txt
